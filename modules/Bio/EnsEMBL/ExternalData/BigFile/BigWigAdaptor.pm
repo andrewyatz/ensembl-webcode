@@ -23,6 +23,7 @@ use SiteDefs;
 use Data::Dumper;
 use Bio::DB::BigFile;
 use Bio::DB::BigFile::Constants;
+use POSIX qw/ceil/;
 my $DEBUG = 0;
 our $USE_PP = 0;
 
@@ -120,7 +121,7 @@ sub mean_summary {
 
   # Query
   my $summary;
-  my @params = ($bw, $seq_id, $slice->start-1, $slice->end, $bins, $slice->strand, $slice->length, $slice, $analysis);
+  my @params = ($bw, $seq_id, $slice->start-1, $slice->end, $bins, $slice->strand, $slice, $analysis);
   if($USE_PP) { # if forced use Perl
     $summary = $self->_pp_mean_summary(@params);
   }
@@ -142,9 +143,8 @@ sub mean_summary {
   Args [4]   : Integer; end to query to (UCSC formatted)
   Args [5]   : Integer; number of summary bins required
   Args [6]   : Integer; strand to produce elements for (1/-1)
-  Args [7]   : Integer; size of the region to summarise
-  Args [8]   : Bio::EnsEMBL::Slice; Slice object to attach to the eventual data hash. Can be undef
-  Args [9]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
+  Args [7]   : Bio::EnsEMBL::Slice; Slice object to attach to the eventual data hash. Can be undef
+  Args [8]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
   Description: A pure perl implementation to summarise a BigWig file into mean bins of data. This
                method is used only when Inline::C is not available to compile a working C based
                solution (which is faster than this).
@@ -156,10 +156,11 @@ sub mean_summary {
 =cut
 
 sub _pp_mean_summary {
-  my ($self, $bw_file, $seq_region, $start, $end, $bins, $strand, $size, $slice, $analysis) = @_;
+  my ($self, $bw_file, $seq_region, $start, $end, $bins, $strand, $slice, $analysis) = @_;
   my $summary = $bw_file->bigWigSummaryArray($seq_region, $start, $end, bbiSumMean, $bins);
-  my $bin_width = $size / $bins;
-  my $flip      = $strand == -1 ? $size + 1 : undef;
+  my $query_width = ($end-$start);
+  my $bin_width = ceil(($query_width) / $bins);
+  my $flip      = $strand == -1 ? $query_width + 1 : undef;
   my @features;
   
   my $min_max_init = 0;
@@ -205,10 +206,11 @@ eval {
 #include "common.h"
 #include "bbiFile.h"
 #include "bigWig.h"
+#include "math.h"
 
 typedef struct bbiFile     *Bio__DB__bbiFile;
 
-SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int bins, int strand, int size, SV* slice, SV* analysis) {
+SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int bins, int strand, SV* slice, SV* analysis) {
   int     i;
   int     binWidth;
   int     queryWidth;
@@ -221,16 +223,18 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
   HV     *h;
   AV     *av;
 
-  summaryType = 1;
+  queryWidth = (end - start);
+  binWidth = ceil((double)queryWidth/(double)bins);
+  summaryType = 0;
 
   //We need to access the backing C struct not the Perl SV* ref
   struct bbiFile *unwrappedBbiFile;
   unwrappedBbiFile = (struct bbiFile*)SvIV(SvRV(bwf));
 
   //values is the elements brought back from BigWig according to the summary
-  values = Newx(values,size,double);
+  values = Newx(values,bins,double);
   //This is the call to kent src libs to get the summary into values
-  result = bigWigSummaryArray(unwrappedBbiFile,seq_region,start,end,summaryType,size,values);
+  result = bigWigSummaryArray(unwrappedBbiFile,seq_region,start,end,summaryType,bins,values);
 
   // Get our return values ready
   av = newAV();
@@ -238,10 +242,8 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
   max = 0.0;
    
   if (result == TRUE) {
-   queryWidth = (end-start);
-   binWidth = (queryWidth/size);
    
-   for (i=0;i<size;i++) {
+   for (i=0;i<bins;i++) {
      currentValue = values[i];
      if(! isnan(currentValue)) {
        h = newHV();
