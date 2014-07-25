@@ -19,10 +19,12 @@ limitations under the License.
 package Bio::EnsEMBL::ExternalData::BigFile::BigWigAdaptor;
 use strict;
 
+use SiteDefs;
 use Data::Dumper;
 use Bio::DB::BigFile;
 use Bio::DB::BigFile::Constants;
 my $DEBUG = 0;
+our $USE_PP = 0;
 
 
 sub new {
@@ -91,5 +93,214 @@ sub fetch_extended_summary_array {
   
   return $summary_e;
 }
+
+=head2 _pp_mean_summary
+ 
+  Args [1]   : Bio::EnsEMBL::Slice; Slice to query against
+  Args [2]   : Integer; number of summary bins required
+  Args [3]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
+  Description: Retrieve a summary of the requested region as mean scores within the region
+  Returntype : ArrayRef of summary hashes. Keys are min, max, features. Features 
+               is an ArrayRef holding the keys start, end, slice, analysis, score representing
+               the summarised averaged block
+  Exceptions : None
+
+=cut
+
+
+sub mean_summary {
+  my ($self, $slice, $bins, $analysis) = @_;
+  my $bw = $self->bigwig_open;
+  warn "Failed to open BigWig file" . $self->url unless $bw;
+  return { features => [], min => 0, max => 0 } unless $bw;
+  
+  #  Maybe need to add 'chr' 
+  my $seq_id = $self->munge_chr_id($slice->seq_region_name());
+  return { features => [], min => 0, max => 0 } if !defined($seq_id);
+
+  # Query
+  my $summary;
+  my @params = ($bw, $seq_id, $slice->start-1, $slice->end, $bins, $slice->strand, $slice->length, $slice, $analysis);
+  if($USE_PP) { # if forced use Perl
+    $summary = $self->_pp_mean_summary(@params);
+  }
+  else { # if not use what's available
+    $summary = $self->_mean_summary(@params);
+  }
+  if ($DEBUG) {
+    warn " *** fetch extended summary: ".$slice->name()." : found ", scalar(@{$summary->{features}}), " summary points\n";
+  }
+
+  return $summary;
+}
+
+=head2 _pp_mean_summary
+ 
+  Args [1]   : Bio::DB::BigFile; BigWig file to query against
+  Args [2]   : String; seq_region to query for
+  Args [3]   : Integer; start to query (UCSC formatted)
+  Args [4]   : Integer; end to query to (UCSC formatted)
+  Args [5]   : Integer; number of summary bins required
+  Args [6]   : Integer; strand to produce elements for (1/-1)
+  Args [7]   : Integer; size of the region to summarise
+  Args [8]   : Bio::EnsEMBL::Slice; Slice object to attach to the eventual data hash. Can be undef
+  Args [9]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
+  Description: A pure perl implementation to summarise a BigWig file into mean bins of data. This
+               method is used only when Inline::C is not available to compile a working C based
+               solution (which is faster than this).
+  Returntype : ArrayRef of summary hashes. Keys are min, max, features. Features 
+               is an ArrayRef holding the keys start, end, slice, analysis, score representing
+               the summarised averaged block
+  Exceptions : None
+
+=cut
+
+sub _pp_mean_summary {
+  my ($self, $bw_file, $seq_region, $start, $end, $bins, $strand, $size, $slice, $analysis) = @_;
+  my $summary = $bw_file->bigWigSummaryArray($seq_region, $start, $end, bbiSumMean, $bins);
+  my $bin_width = $size / $bins;
+  my $flip      = $strand == -1 ? $size + 1 : undef;
+  my @features;
+  
+  my $min_max_init = 0;
+  my ($min, $max) = (0,0);
+  for (my $i = 0; $i < $bins; $i++) {
+    my $score = $summary->[$i];
+    next unless defined $score;
+
+    if(!$min_max_init) {
+      ($min, $max) = ($score, $score);
+      $min_max_init = 1;
+    }
+
+    $min = $score if $score < $min;
+    $max = $score if $score > $max;
+    
+    push @features, {
+      start => $flip ? $flip - (($i + 1) * $bin_width) : ($i * $bin_width + 1),
+      end   => $flip ? $flip - ($i * $bin_width + 1)   : (($i + 1) * $bin_width),
+      score => $score,
+      analysis => $analysis,
+      slice => $slice
+    };
+  }
+
+  return {
+    min => $min,
+    max => $max,
+    features => \@features
+  };
+}
+
+eval {
+   require Inline;
+   Inline->import (C => Config =>
+                   BUILD_NOISY => 1,
+                   INC => "-I$SiteDefs::JKSRC_DIR/inc",
+                   LIBS => "-L$SiteDefs::JKSRC_DIR/lib/$ENV{MACHTYPE}/jkweb.a",
+                   DIRECTORY => "$SiteDefs::ENSEMBL_WEBROOT/cbuild",
+                   TYPEMAPS => "$SiteDefs::ENSEMBL_WEBROOT/typemap");
+   Inline->import (C =><<'EOC');
+
+#include "common.h"
+#include "bbiFile.h"
+#include "bigWig.h"
+
+typedef struct bbiFile     *Bio__DB__bbiFile;
+
+SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int bins, int strand, int size, SV* slice, SV* analysis) {
+  int     i;
+  int     binWidth;
+  int     queryWidth;
+  int     summaryType;
+  double  min;
+  double  max;
+  double  currentValue;
+  boolean result;
+  double  *values;
+  HV     *h;
+  AV     *av;
+
+  summaryType = 1;
+
+  //We need to access the backing C struct not the Perl SV* ref
+  struct bbiFile *unwrappedBbiFile;
+  unwrappedBbiFile = (struct bbiFile*)SvIV(SvRV(bwf));
+
+  //values is the elements brought back from BigWig according to the summary
+  values = Newx(values,size,double);
+  //This is the call to kent src libs to get the summary into values
+  result = bigWigSummaryArray(unwrappedBbiFile,seq_region,start,end,summaryType,size,values);
+
+  // Get our return values ready
+  av = newAV();
+  min = 0.0;
+  max = 0.0;
+   
+  if (result == TRUE) {
+   queryWidth = (end-start);
+   binWidth = (queryWidth/size);
+   
+   for (i=0;i<size;i++) {
+     currentValue = values[i];
+     if(! isnan(currentValue)) {
+       h = newHV();
+       //Check for the current min value
+       if(min == 0) {
+         min = currentValue;
+       }
+       else {
+         if(currentValue < min) {
+           min = currentValue;
+         }
+       }
+       
+       //Do the same for max
+       if(max == 0) {
+         max = currentValue;
+       }
+       else {
+         if(currentValue > max) {
+           max = currentValue;
+         }
+       }
+       
+       // Calculate bin coordinates in Ensembl positions (+1)
+       unsigned int start,end;
+       if(strand == 1) {
+         start = i*binWidth+1; //ensembl start
+         end = (i+1)*binWidth; //ensembl end
+       }
+       else {
+         start = queryWidth - ((i+1)*binWidth); //ensembl start
+         end = queryWidth - (i*binWidth+1); //ensembl end
+       }
+       
+       //Now store them in the hash and add the hash to the output array
+       (void)hv_store(h,"score",    5, newSVnv(currentValue),0);
+       (void)hv_store(h,"start",    5, newSVnv(start),0);
+       (void)hv_store(h,"end",      3, newSVnv(end),0);
+       (void)hv_store(h,"slice",    5, (!SvOK(slice) ? &PL_sv_undef : SvREFCNT_inc(slice)),0);
+       (void)hv_store(h,"analysis", 8, (!SvOK(analysis) ? &PL_sv_undef : SvREFCNT_inc(analysis)),0);
+       av_push(av, newRV_noinc((SV*)h));
+     }
+   }
+ }
+ Safefree(values);
+ HV *returnHash = newHV();
+ (void)hv_store(returnHash, "min", 3, newSVnv(min),0);
+ (void)hv_store(returnHash, "max", 3, newSVnv(max),0);
+ (void)hv_store(returnHash, "features", 8, (SV*) newRV_noinc((SV*)av),0);
+ return (SV*) newRV_noinc((SV*)returnHash);
+}
+
+EOC
+};
+
+if($@) {
+  warn $@;
+  *_mean_summary =\&_pp_mean_summary;
+}
+
 
 1;
