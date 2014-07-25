@@ -176,6 +176,7 @@ sub _pp_mean_summary {
       start => $flip ? $flip - (($i + 1) * $bin_width) : ($i * $bin_width + 1),
       end   => $flip ? $flip - ($i * $bin_width + 1)   : (($i + 1) * $bin_width),
       score => $score,
+      strand => 1,
       analysis => $analysis,
       slice => $slice
     };
@@ -287,6 +288,7 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
        (void)hv_store(h,"score",    5, newSVnv(currentValue),0);
        (void)hv_store(h,"start",    5, newSVnv(start),0);
        (void)hv_store(h,"end",      3, newSVnv(end),0);
+       (void)hv_store(h,"strand",   6, newSVnv(1),0);
        (void)hv_store(h,"slice",    5, (!SvOK(slice) ? &PL_sv_undef : SvREFCNT_inc(slice)),0);
        (void)hv_store(h,"analysis", 8, (!SvOK(analysis) ? &PL_sv_undef : SvREFCNT_inc(analysis)),0);
        av_push(av, newRV_noinc((SV*)h));
