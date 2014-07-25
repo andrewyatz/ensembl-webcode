@@ -415,7 +415,8 @@ sub render_coverage {
 
 use Inline C => Config => INC => "-I$SiteDefs::SAMTOOLS_DIR",
                           LIBS => "-L$SiteDefs::SAMTOOLS_DIR -lbam",
-                          DIRECTORY => "$SiteDefs::ENSEMBL_WEBROOT/cbuild";
+                          DIRECTORY => "$SiteDefs::ENSEMBL_WEBROOT/cbuild"
+                          BUILD_NOISY => $SiteDefs::C_BUILD_NOISY;
 
 ##    Inline->init;
 #

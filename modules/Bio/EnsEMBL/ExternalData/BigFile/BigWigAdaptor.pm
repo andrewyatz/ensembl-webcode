@@ -95,19 +95,16 @@ sub fetch_extended_summary_array {
   return $summary_e;
 }
 
-=head2 _pp_mean_summary
+=head2 mean_summary
  
   Args [1]   : Bio::EnsEMBL::Slice; Slice to query against
   Args [2]   : Integer; number of summary bins required
   Args [3]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
   Description: Retrieve a summary of the requested region as mean scores within the region
-  Returntype : ArrayRef of summary hashes. Keys are min, max, features. Features 
-               is an ArrayRef holding the keys start, end, slice, analysis, score representing
-               the summarised averaged block
+  Returntype : HashRef described as follows { min, max, features => [ { score, start, end, slice, analysis}, {...} ]  }
   Exceptions : None
 
 =cut
-
 
 sub mean_summary {
   my ($self, $slice, $bins, $analysis) = @_;
@@ -147,10 +144,8 @@ sub mean_summary {
   Args [8]   : Bio::EnsEMBL::Analysis; Analysis object to attach to the eventual data hash. Can be undef
   Description: A pure perl implementation to summarise a BigWig file into mean bins of data. This
                method is used only when Inline::C is not available to compile a working C based
-               solution (which is faster than this).
-  Returntype : ArrayRef of summary hashes. Keys are min, max, features. Features 
-               is an ArrayRef holding the keys start, end, slice, analysis, score representing
-               the summarised averaged block
+               solution. C is twice as fast than this for 1kb to 1Mb ranges of summaries depending upon
+               the number of requested bins.
   Exceptions : None
 
 =cut
@@ -196,7 +191,7 @@ sub _pp_mean_summary {
 eval {
    require Inline;
    Inline->import (C => Config =>
-                   BUILD_NOISY => 1,
+                   BUILD_NOISY => $SiteDefs::C_BUILD_NOISY,
                    INC => "-I$SiteDefs::JKSRC_DIR/inc",
                    LIBS => "-L$SiteDefs::JKSRC_DIR/lib/$ENV{MACHTYPE}/jkweb.a",
                    DIRECTORY => "$SiteDefs::ENSEMBL_WEBROOT/cbuild",
@@ -209,7 +204,11 @@ eval {
 #include "math.h"
 
 typedef struct bbiFile     *Bio__DB__bbiFile;
+typedef struct bbiSummaryElement *Bio__DB__bbiExtendedSummaryEl;
 
+// This code has lived two lives; the first used bigWigSummaryArray() and asked for a mean summary. The
+// second version uses bigWigSummaryArrayExtended() and calculates the mean itself trying to
+// save a couple of cycles in the process.
 SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int bins, int strand, SV* slice, SV* analysis) {
   int     i;
   int     binWidth;
@@ -219,7 +218,8 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
   double  max;
   double  currentValue;
   boolean result;
-  double  *values;
+  //double  *values;
+  struct bbiSummaryElement *summary;
   HV     *h;
   AV     *av;
 
@@ -232,9 +232,11 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
   unwrappedBbiFile = (struct bbiFile*)SvIV(SvRV(bwf));
 
   //values is the elements brought back from BigWig according to the summary
-  values = Newx(values,bins,double);
+  //values = Newx(values,bins,double);
+  summary = Newxz(summary, bins, struct bbiSummaryElement);
   //This is the call to kent src libs to get the summary into values
-  result = bigWigSummaryArray(unwrappedBbiFile,seq_region,start,end,summaryType,bins,values);
+  //result = bigWigSummaryArray(unwrappedBbiFile,seq_region,start,end,summaryType,bins,values);
+  result = bigWigSummaryArrayExtended(unwrappedBbiFile,seq_region,start,end,bins,summary);
 
   // Get our return values ready
   av = newAV();
@@ -244,7 +246,10 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
   if (result == TRUE) {
    
    for (i=0;i<bins;i++) {
-     currentValue = values[i];
+     //currentValue = values[i];
+     struct bbiSummaryElement *el = &summary[i];
+     double currentValue = el->sumData/el->validCount;
+
      if(! isnan(currentValue)) {
        h = newHV();
        //Check for the current min value
@@ -288,7 +293,8 @@ SV * _mean_summary(SV* self, SV* bwf, char* seq_region, int start, int end, int 
      }
    }
  }
- Safefree(values);
+ //Safefree(values);
+ Safefree(summary);
  HV *returnHash = newHV();
  (void)hv_store(returnHash, "min", 3, newSVnv(min),0);
  (void)hv_store(returnHash, "max", 3, newSVnv(max),0);
